@@ -1,3 +1,5 @@
 pdfs/
 *.pkl
 *.pth
+*.zip
+checkpoints/
