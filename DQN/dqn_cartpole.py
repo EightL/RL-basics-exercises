@@ -21,6 +21,8 @@ class QNetwork(nn.Module):
     
 import random
 from collections import deque 
+import pickle
+import os
 
 # Whats is a replay buffer?
 # A replay buffer is a buffer that stores the experiences of the agent.
@@ -43,11 +45,53 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+class EpisodeRecorder:
+    def __init__(self, max_saved_episodes=10):
+        self.max_saved_episodes = max_saved_episodes
+        self.best_episodes = []  # List of (reward, episode_data) tuples
+        
+    def record_episode(self, episode_data, total_reward):
+        """Record an episode if it's among the best"""
+        episode_info = {
+            'frames': episode_data['frames'],
+            'actions': episode_data['actions'],
+            'rewards': episode_data['rewards'],
+            'total_reward': total_reward,
+            'episode_length': len(episode_data['frames'])
+        }
+        
+        # Add to best episodes if we have room or if it's better than worst
+        if len(self.best_episodes) < self.max_saved_episodes:
+            self.best_episodes.append((total_reward, episode_info))
+            self.best_episodes.sort(key=lambda x: x[0], reverse=True)  # Sort by reward
+        elif total_reward > self.best_episodes[-1][0]:
+            # Replace worst episode
+            self.best_episodes[-1] = (total_reward, episode_info)
+            self.best_episodes.sort(key=lambda x: x[0], reverse=True)
+    
+    def save_episodes(self, filename='best_episodes.pkl'):
+        """Save best episodes to file"""
+        with open(filename, 'wb') as f:
+            pickle.dump(self.best_episodes, f)
+        print(f"Saved {len(self.best_episodes)} best episodes to {filename}")
+    
+    def load_episodes(self, filename='best_episodes.pkl'):
+        """Load episodes from file"""
+        if os.path.exists(filename):
+            with open(filename, 'rb') as f:
+                self.best_episodes = pickle.load(f)
+            print(f"Loaded {len(self.best_episodes)} episodes from {filename}")
+        else:
+            print(f"No saved episodes found at {filename}")
+
 import gym
 import numpy as np
 import time
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
-env = gym.make('CartPole-v1')
+# Create environment with rgb_array render mode for proper frame capture
+env = gym.make('CartPole-v1', render_mode='rgb_array')
 
 state_size = env.observation_space.shape[0] # 4 state variables
 action_size = env.action_space.n # 2 possible actions
@@ -66,6 +110,7 @@ optimizer = torch.optim.Adam(q_network.parameters(), lr=1e-3) # default learning
 # -> this results in smooth gradient descent, and prevents overshooting the minimum (like walking vs skiing downhill)
 
 replay_buffer = ReplayBuffer(10000)
+episode_recorder = EpisodeRecorder(max_saved_episodes=5)  # Save top 5 episodes
 
 epsilon = 1.0 # initial epsilon
 epsilon_decay = 0.995 # decay rate
@@ -106,18 +151,67 @@ def render_episodes(q_network, env_name, num_episodes=5, use_policy=True):
         print(f"Episode {ep+1}: Total reward = {total_reward}")
     env.close()
 
+def visualize_saved_episodes(episode_recorder, num_episodes_to_show=3):
+    """Visualize the best saved episodes"""
+    if not episode_recorder.best_episodes:
+        print("No episodes to visualize!")
+        return
+    
+    # Show top episodes
+    episodes_to_show = min(num_episodes_to_show, len(episode_recorder.best_episodes))
+    
+    for i in range(episodes_to_show):
+        reward, episode_data = episode_recorder.best_episodes[i]
+        frames = episode_data['frames']
+        actions = episode_data['actions']
+        total_reward = episode_data['total_reward']
+        
+        print(f"\n=== Episode {i+1} (Reward: {total_reward}) ===")
+        
+        # Create animation
+        fig, ax = plt.subplots(figsize=(8, 6))
+        plt.axis('off')
+        
+        if frames and len(frames) > 0:
+            # Ensure frame is a numpy array
+            first_frame = np.array(frames[0])
+            im = ax.imshow(first_frame)
+            ax.set_title(f'Best Episode {i+1} - Total Reward: {total_reward}')
+            
+            def update(frame_idx):
+                if frame_idx < len(frames):
+                    frame = np.array(frames[frame_idx])
+                    im.set_data(frame)
+                return [im]
+            
+            ani = FuncAnimation(fig, update, frames=len(frames), 
+                              interval=100, blit=True, repeat=True)
+            plt.show()
+        else:
+            print("No valid frames to display!")
+        
+        # Wait a bit between episodes
+        time.sleep(2)
+
 # --- Now you can call it before training ---
 print("Showing first 5 episodes (untrained agent):")
 render_episodes(q_network, 'CartPole-v1', num_episodes=5, use_policy=False)
 
 # training loop
-for episode in range(500):
+for episode in range(100):
     state = env.reset()
     if isinstance(state, tuple):
         state = state[0]  # handle new gym API that returns (state, info)
     state = np.array(state, dtype=np.float32)  # convert to numpy array first
     state = torch.FloatTensor(state)  # then convert to tensor
     total_reward = 0
+
+    # Record episode data
+    episode_data = {
+        'frames': [],
+        'actions': [],
+        'rewards': []
+    }
 
     done = False
     while not done:
@@ -138,6 +232,17 @@ for episode in range(500):
         next_state = np.array(next_state, dtype=np.float32)  # convert to numpy array first
         next_state = torch.FloatTensor(next_state) # convert next state to tensor
         replay_buffer.push(state, action, reward, next_state, done) # store experience in buffer
+
+        # Record frame and action - use rgb_array mode for proper frame capture
+        try:
+            frame = env.render()
+            if frame is not None:
+                episode_data['frames'].append(frame)
+        except:
+            # If render fails, skip frame recording
+            pass
+        episode_data['actions'].append(action)
+        episode_data['rewards'].append(reward)
 
         state = next_state
         total_reward += reward
@@ -167,8 +272,55 @@ for episode in range(500):
 
             epsilon = max(epsilon_min, epsilon * epsilon_decay) # decay epsilon
 
-            print(f"Episode {episode} - Total reward: {total_reward} - Epsilon: {epsilon:.3f}")
+    # Record this episode if it's among the best
+    episode_recorder.record_episode(episode_data, total_reward)
+    
+    if episode % 50 == 0:  # Print every 50 episodes
+        print(f"Episode {episode} - Total reward: {total_reward} - Epsilon: {epsilon:.3f}")
+
+# Save the best episodes
+episode_recorder.save_episodes('best_cartpole_episodes.pkl')
+
+# Save the trained model for later use
+torch.save(q_network.state_dict(), 'best_cartpole_dqn.pth')
+print("Saved trained model to best_cartpole_dqn.pth")
 
 # --- And after training ---
 print("Showing last 5 episodes (trained agent):")
 render_episodes(q_network, 'CartPole-v1', num_episodes=5, use_policy=True)
+
+# Visualize the best saved episodes
+print("\n=== Visualizing Best Episodes ===")
+visualize_saved_episodes(episode_recorder, num_episodes_to_show=3)
+
+# Load the trained model
+q_network = QNetwork(4, 2)
+q_network.load_state_dict(torch.load('best_cartpole_dqn.pth'))
+q_network.eval()
+
+# Run evaluation
+env = gym.make('CartPole-v1', render_mode='human')
+for ep in range(3):
+    state = env.reset()
+    if isinstance(state, tuple):
+        state = state[0]
+    state = np.array(state, dtype=np.float32)
+    state = torch.FloatTensor(state)
+    done = False
+    total_reward = 0
+    while not done:
+        with torch.no_grad():
+            q_values = q_network(state)
+            action = q_values.argmax().item()
+        result = env.step(action)
+        if len(result) == 4:
+            next_state, reward, done, _ = result
+        else:
+            next_state, reward, terminated, truncated, _ = result
+            done = terminated or truncated
+        next_state = np.array(next_state, dtype=np.float32)
+        state = torch.FloatTensor(next_state)
+        total_reward += reward
+        time.sleep(0.02)
+    print(f"Episode {ep+1}: Total reward = {total_reward}")
+env.close()
